@@ -487,6 +487,28 @@ class T5Attention(nn.Module):
         query_states = self.q(hidden_states)
         query_states = query_states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
 
+
+        # real sequence length to do data-dependent slicing (T5 has extra info, 
+        # yay but fallback when none.):
+        # the extra info is unknown to the compiler, so if there is a operation 
+        # where they are used, the compiler will have no idea what the possible values could be.
+        if query_length is not None:
+            real_seq_length_item = query_length
+        elif position_bias is not None:
+            real_seq_length_item = position_bias.shape[-1]
+        else:
+            torch._dynamo.config.capture_scalar_outputs = True
+            real_seq_length = cache_position[-1] + 1 # crap, we know nothing
+
+            real_seq_length_item = real_seq_length.item()
+            torch._check_is_size(real_seq_length_item)
+            torch._check(real_seq_length_item > 0)
+            if past_key_value is not None:
+                # the past_key_value self attention cache will always be larger than the current decoder sequence length.
+                torch._check(real_seq_length_item < past_key_value.self_attention_cache.max_cache_len)
+            if mask is not None:
+                torch._check(real_seq_length_item <= mask.shape[-1])
+
         if past_key_value is not None:
             is_updated = past_key_value.is_updated.get(self.layer_idx)
             if is_cross_attention:
@@ -533,13 +555,19 @@ class T5Attention(nn.Module):
                     key_states = key_states_full[:batch_size,:,:,:]
                     value_states = value_states_full[:batch_size,:,:,:]
 
+                    # only return used kv values (gets around data-dependent slicing):
+                    # cache_len_item = cache_len
+                     # the output key states are not empty.
+                    # need to make sure scores shape is the same as position_biased_masked:
+                    key_states = key_states.narrow(2, 0, real_seq_length_item)
+                    value_states = value_states.narrow(2, 0, real_seq_length_item)
+
         # compute scores, equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
         scores = torch.matmul(query_states, key_states.transpose(3, 2))
 
         if position_bias is None:
             key_length = key_states.shape[-2]
             # cache position is 0-indexed so we add 1 to get the real length of queries (aka with past)
-            real_seq_length = query_length if query_length is not None else cache_position[-1] + 1
             if not self.has_relative_attention_bias:
                 position_bias = torch.zeros(
                     (1, self.n_heads, seq_length, key_length), device=scores.device, dtype=scores.dtype
@@ -548,12 +576,13 @@ class T5Attention(nn.Module):
                     position_bias.requires_grad = True
             else:
                 position_bias = self.compute_bias(
-                    real_seq_length, key_length, device=scores.device, cache_position=cache_position
+                    real_seq_length_item, key_length, device=scores.device, cache_position=cache_position
                 )
                 position_bias = position_bias[:, :, -seq_length:, :]
 
             if mask is not None:
-                causal_mask = mask[:, :, :, : key_states.shape[-2]]
+                end = scores.shape[-1]
+                causal_mask = mask[:, :, :, : end]
                 position_bias = position_bias + causal_mask
 
         if self.pruned_heads:
