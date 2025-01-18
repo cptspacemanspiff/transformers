@@ -1208,8 +1208,10 @@ class StaticCache(Cache):
             # `tensor[:, :, index] = tensor`, but the first one is compile-friendly and it does explicitly an in-place
             # operation, that avoids copies and uses less memory.
             try:
-                k_out[:bz].index_copy_(2, cache_position, key_states)
-                v_out[:bz].index_copy_(2, cache_position, value_states)
+                k_batched = torch.narrow(k_out, 0, 0, bz)
+                v_batched = torch.narrow(v_out, 0, 0, bz)
+                k_batched.index_copy_(2, cache_position, key_states)
+                v_batched.index_copy_(2, cache_position, value_states)
             except NotImplementedError:
                 # The operator 'aten::index_copy.out' is not currently implemented for the MPS device.
                 k_out[:bz, :, cache_position] = key_states
