@@ -1217,7 +1217,8 @@ class StaticCache(Cache):
                 k_out[:bz, :, cache_position] = key_states
                 v_out[:bz, :, cache_position] = value_states
 
-        return k_out, v_out
+        # return narrowed tensors to allow for larger than standard cache sizes.
+        return torch.narrow(k_out, 0, 0, bz), torch.narrow(v_out, 0, 0, bz)
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states that were seen by the model."""

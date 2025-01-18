@@ -165,8 +165,6 @@ class MarianAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[EncoderDecoderCache]]:
         """Input shape: Batch x Time x Channel"""
-        batch_size, seq_length = hidden_states.shape[:2]
-
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
         is_cross_attention = key_value_states is not None
@@ -192,7 +190,7 @@ class MarianAttention(nn.Module):
             # reuse k,v, cross_attentions
             # get cross attn sequence length.
             cross_seq_length = current_states.shape[1]
-
+            batch_size = current_states.shape[0]
             key_states_full = curr_past_key_value.key_cache[self.layer_idx]
             value_states_full = curr_past_key_value.value_cache[self.layer_idx]
             # slice into state b/c cache may be larger:
@@ -205,24 +203,20 @@ class MarianAttention(nn.Module):
                 # save all key/value_states to cache to be re-used for fast auto-regressive generation
                 if is_cross_attention:
                     cross_seq_length = current_states.shape[1]
-                    cache_position = torch.arange(
-                        0, cross_seq_length
-                    )  # Save into specific cells is there a alternative to passing a varying length position?
+                    cache_position = torch.ones_like(current_states[0, :, 0], dtype=torch.int64).cumsum(0) - 1
                     key_states_full, value_states_full = curr_past_key_value.update(
                         key_states, value_states, self.layer_idx, {"cache_position": cache_position}
                     )
                     # set flag that curr layer for cross-attn is already updated so we can re-use in subsequent calls
                     past_key_value.is_updated[self.layer_idx] = True
                     # slice into state b/c cache may be larger:
-                    key_states = key_states_full[:batch_size, :, :cross_seq_length, :]
-                    value_states = value_states_full[:batch_size, :, :cross_seq_length, :]
+                    key_states = key_states_full[:, :, :cross_seq_length, :]
+                    value_states = value_states_full[:, :, :cross_seq_length, :]
                 else:
                     cache_position = cache_position
-                    key_states_full, value_states_full = curr_past_key_value.update(
+                    key_states, value_states = curr_past_key_value.update(
                         key_states, value_states, self.layer_idx, {"cache_position": cache_position}
                     )
-                    key_states = key_states_full[:batch_size, :, :, :]
-                    value_states = value_states_full[:batch_size, :, :, :]
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
 
