@@ -203,7 +203,9 @@ class MarianAttention(nn.Module):
                 # save all key/value_states to cache to be re-used for fast auto-regressive generation
                 if is_cross_attention:
                     cross_seq_length = current_states.shape[1]
+                    # torch arange(0, encoder_seq_length) equivilent.
                     cache_position = torch.ones_like(current_states[0, :, 0], dtype=torch.int64).cumsum(0) - 1
+                    # cache position here is used to say update the whole cross attention sequence length.
                     key_states_full, value_states_full = curr_past_key_value.update(
                         key_states, value_states, self.layer_idx, {"cache_position": cache_position}
                     )
