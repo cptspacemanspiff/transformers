@@ -194,8 +194,8 @@ class MarianAttention(nn.Module):
             key_states_full = curr_past_key_value.key_cache[self.layer_idx]
             value_states_full = curr_past_key_value.value_cache[self.layer_idx]
             # slice into state b/c cache may be larger:
-            key_states = key_states_full[:batch_size, :, :cross_seq_length, :]
-            value_states = value_states_full[:batch_size, :, :cross_seq_length, :]
+            key_states = key_states_full.narrow(0,0,batch_size).narrow(2,0,cross_seq_length)
+            value_states = value_states_full.narrow(0,0,batch_size).narrow(2,0,cross_seq_length)
         else:
             key_states = self._shape(self.k_proj(current_states), -1, bsz)
             value_states = self._shape(self.v_proj(current_states), -1, bsz)
@@ -212,6 +212,8 @@ class MarianAttention(nn.Module):
                     # set flag that curr layer for cross-attn is already updated so we can re-use in subsequent calls
                     past_key_value.is_updated[self.layer_idx] = True
                     # slice into state b/c cache may be larger:
+                    # key_states = key_states_full.narrow(2,0,cross_seq_length) # need to use narrow, for the symbolic tracing to work properly.
+                    # value_states = value_states_full.narrow(2,0,cross_seq_length)
                     key_states = key_states_full[:, :, :cross_seq_length, :]
                     value_states = value_states_full[:, :, :cross_seq_length, :]
                 else:
