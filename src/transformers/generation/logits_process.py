@@ -1612,11 +1612,19 @@ class ForcedEOSTokenLogitsProcessor(LogitsProcessor):
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         cur_len = input_ids.shape[-1]
+        force_eos = torch.tensor(cur_len == self.max_length - 1, dtype=torch.int32)
         scores_processed = scores
-        if cur_len == self.max_length - 1:
-            scores_processed = torch.full_like(scores, -math.inf)
-            scores_processed[:, self.eos_token_id] = 0
-        return scores_processed
+
+        # always do this:
+        scores_forced = torch.full(scores.shape, -math.inf)
+        scores_forced[self.eos_token_id] = 0
+
+        # concatenate the scores along a new dimension:
+        cat_scores = torch.cat((scores_processed.unsqueeze(0),scores.unsqueeze(0),),0)
+
+        # Now index via the current shape:
+        output = cat_scores.index_select(0, force_eos).squeeze(0)
+        return output
 
 
 class InfNanRemoveLogitsProcessor(LogitsProcessor):
