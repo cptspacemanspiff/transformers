@@ -13,6 +13,8 @@ from ..pytorch_utils import isin_mps_friendly
 from ..tokenization_utils_base import PreTrainedTokenizerBase
 from ..utils import add_start_docstrings, logging
 
+from torch.compiler import is_exporting
+
 
 logger = logging.get_logger(__name__)
 # We maintain a module-level cache of the embedding vectors for the stop string criterion
@@ -75,12 +77,13 @@ class MaxLengthCriteria(StoppingCriteria):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
         cur_len = input_ids.shape[-1]
         is_done = cur_len >= self.max_length
-        if self.max_position_embeddings is not None and not is_done and cur_len >= self.max_position_embeddings:
-            logger.warning_once(
-                "This is a friendly reminder - the current text generation call will exceed the model's predefined "
-                f"maximum length ({self.max_position_embeddings}). Depending on the model, you may observe "
-                "exceptions, performance degradation, or nothing at all."
-            )
+        if not is_exporting(): # cannot have data-dependent control flow in export
+            if self.max_position_embeddings is not None and not is_done and cur_len >= self.max_position_embeddings:
+                logger.warning_once(
+                    "This is a friendly reminder - the current text generation call will exceed the model's predefined "
+                    f"maximum length ({self.max_position_embeddings}). Depending on the model, you may observe "
+                    "exceptions, performance degradation, or nothing at all."
+                )
         return torch.full((input_ids.shape[0],), is_done, device=input_ids.device, dtype=torch.bool)
 
 
