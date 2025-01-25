@@ -465,7 +465,7 @@ class EosTokenCriteria(StoppingCriteria):
 
     @add_start_docstrings(STOPPING_CRITERIA_INPUTS_DOCSTRING)
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
-        self.eos_token_id = self.eos_token_id.to(input_ids.device)
+        self.eos_token_id = self.eos_token_id #self.eos_token_id.to(input_ids.device)
         is_done = isin_mps_friendly(input_ids[:, -1], self.eos_token_id)
         return is_done
 

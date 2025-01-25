@@ -212,10 +212,10 @@ class MarianAttention(nn.Module):
                     # set flag that curr layer for cross-attn is already updated so we can re-use in subsequent calls
                     past_key_value.is_updated[self.layer_idx] = True
                     # slice into state b/c cache may be larger:
-                    # key_states = key_states_full.narrow(2,0,cross_seq_length) # need to use narrow, for the symbolic tracing to work properly.
-                    # value_states = value_states_full.narrow(2,0,cross_seq_length)
-                    key_states = key_states_full[:, :, :cross_seq_length, :]
-                    value_states = value_states_full[:, :, :cross_seq_length, :]
+                    key_states = key_states_full.narrow(2,0,cross_seq_length) # need to use narrow, for the symbolic tracing to work properly.
+                    value_states = value_states_full.narrow(2,0,cross_seq_length)
+                    # key_states = key_states_full[:, :, :cross_seq_length, :]
+                    # value_states = value_states_full[:, :, :cross_seq_length, :]
                 else:
                     cache_position = cache_position
                     key_states, value_states = curr_past_key_value.update(
