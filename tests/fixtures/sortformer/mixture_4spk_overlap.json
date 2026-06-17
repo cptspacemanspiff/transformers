@@ -1,0 +1,43 @@
+{
+  "description": "Synthetic 4-speaker overlapping mixture for Sortformer diarization testing. Four distinct LibriSpeech speakers (~8s each) with widely-spaced onsets so that at most two speakers ever overlap at once, with single-speaker gaps in between; speaker 3 is mixed at a lower level than the others to test robustness to level imbalance.",
+  "source_dataset": "openslr/librispeech_asr (clean/test)",
+  "source_license": "CC BY 4.0",
+  "generator_script": "generate_mixture_4spk_overlap.py",
+  "audio_file": "mixture_4spk_overlap.wav",
+  "sampling_rate": 16000,
+  "num_speakers": 4,
+  "max_simultaneous_speakers": 2,
+  "duration_sec": 27.0,
+  "frame_stride_sec": 0.08,
+  "mix_final_peak": 0.9,
+  "speakers": [
+    {
+      "speaker": 0,
+      "source_speaker_id": "6930",
+      "start_sec": 0.0,
+      "end_sec": 8.0,
+      "level": 0.6
+    },
+    {
+      "speaker": 1,
+      "source_speaker_id": "1320",
+      "start_sec": 6.0,
+      "end_sec": 14.0,
+      "level": 0.6
+    },
+    {
+      "speaker": 2,
+      "source_speaker_id": "5639",
+      "start_sec": 12.0,
+      "end_sec": 20.0,
+      "level": 0.6
+    },
+    {
+      "speaker": 3,
+      "source_speaker_id": "260",
+      "start_sec": 18.0,
+      "end_sec": 26.0,
+      "level": 0.3
+    }
+  ]
+}

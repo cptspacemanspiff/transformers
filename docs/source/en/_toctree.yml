@@ -1129,6 +1129,8 @@
         title: SEW
       - local: model_doc/sew-d
         title: SEW-D
+      - local: model_doc/sortformer
+        title: Sortformer
       - local: model_doc/speech_to_text
         title: Speech2Text
       - local: model_doc/speecht5

@@ -462,6 +462,7 @@ MODEL_MAPPING_NAMES = OrderedDict(
         ("smolvlm", "SmolVLMModel"),
         ("smolvlm_vision", "SmolVLMVisionTransformer"),
         ("solar_open", "SolarOpenModel"),
+        ("sortformer", "SortformerModel"),
         ("speech_to_text", "Speech2TextModel"),
         ("speecht5", "SpeechT5Model"),
         ("splinter", "SplinterModel"),
@@ -1733,6 +1734,7 @@ MODEL_FOR_AUDIO_FRAME_CLASSIFICATION_MAPPING_NAMES = OrderedDict(
     [
         # Model for Audio Classification mapping
         ("data2vec-audio", "Data2VecAudioForAudioFrameClassification"),
+        ("sortformer", "SortformerForAudioFrameClassification"),
         ("unispeech-sat", "UniSpeechSatForAudioFrameClassification"),
         ("wav2vec2", "Wav2Vec2ForAudioFrameClassification"),
         ("wav2vec2-bert", "Wav2Vec2BertForAudioFrameClassification"),
