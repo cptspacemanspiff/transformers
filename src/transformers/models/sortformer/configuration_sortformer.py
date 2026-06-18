@@ -73,6 +73,46 @@ class SortformerConfig(PreTrainedConfig):
             The epsilon used by the layer normalization layers of the Transformer encoder.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated-normal initializer for the linear/embedding layers.
+        chunk_len (`int`, *optional*, defaults to 188):
+            Streaming inference: number of (subsampled) frames per processed chunk. A chunk spans
+            `chunk_len * encoder_config.subsampling_factor` input feature frames.
+        chunk_left_context (`int`, *optional*, defaults to 1):
+            Streaming inference: number of extra (subsampled) frames of left context prepended to each chunk before
+            the FastConformer pre-encode. These context frames are used by the encoder but not re-emitted.
+        chunk_right_context (`int`, *optional*, defaults to 1):
+            Streaming inference: number of extra (subsampled) frames of right look-ahead appended to each chunk.
+        spkcache_len (`int`, *optional*, defaults to 188):
+            Streaming inference: fixed capacity (in subsampled frames) of the Arrival-Order Speaker Cache (AOSC). When
+            the accumulated history exceeds this size it is compressed back down to `spkcache_len` frames.
+        fifo_len (`int`, *optional*, defaults to 0):
+            Streaming inference: capacity (in subsampled frames) of the FIFO queue that buffers the most recent
+            embeddings before they are promoted into the speaker cache.
+        spkcache_update_period (`int`, *optional*, defaults to 188):
+            Streaming inference: number of frames popped from the FIFO queue into the speaker cache per update. The
+            effective period is clamped to `[chunk_len, fifo_len + chunk_len]`.
+        spkcache_sil_frames_per_spk (`int`, *optional*, defaults to 3):
+            Streaming inference: number of silence (mean-silence-embedding) slots reserved per speaker when
+            compressing the speaker cache.
+        sil_threshold (`float`, *optional*, defaults to 0.2):
+            Streaming inference: a frame is treated as silence (and folded into the mean silence embedding) when the
+            sum of its speaker probabilities is below this threshold.
+        pred_score_threshold (`float`, *optional*, defaults to 0.25):
+            Streaming inference: probabilities are clamped to this minimum before taking logs when computing
+            speaker-cache importance scores.
+        scores_boost_latest (`float`, *optional*, defaults to 0.05):
+            Streaming inference: additive score boost applied to the most recently added frames during speaker-cache
+            compression, biasing the cache toward newer evidence.
+        strong_boost_rate (`float`, *optional*, defaults to 0.75):
+            Streaming inference: fraction of the per-speaker cache budget that is strongly boosted to guarantee each
+            speaker retains a minimum number of frames.
+        weak_boost_rate (`float`, *optional*, defaults to 1.5):
+            Streaming inference: fraction of the per-speaker cache budget that is weakly boosted to prevent a single
+            speaker from dominating the cache.
+        min_pos_scores_rate (`float`, *optional*, defaults to 0.5):
+            Streaming inference: if a speaker has at least this fraction of the per-speaker budget in positive-scored
+            (confident, non-overlapped) frames, its non-positive (overlapped) frames are disabled during compression.
+        max_index (`int`, *optional*, defaults to 99999):
+            Streaming inference: large placeholder frame index used internally during speaker-cache top-k selection.
 
     Example:
 
@@ -126,6 +166,22 @@ class SortformerConfig(PreTrainedConfig):
     num_speakers: int = 4
     layer_norm_eps: float = 1e-5
     initializer_range: float = 0.02
+
+    # Streaming (Arrival-Order Speaker Cache) inference parameters.
+    chunk_len: int = 188
+    chunk_left_context: int = 1
+    chunk_right_context: int = 1
+    spkcache_len: int = 188
+    fifo_len: int = 0
+    spkcache_update_period: int = 188
+    spkcache_sil_frames_per_spk: int = 3
+    sil_threshold: float = 0.2
+    pred_score_threshold: float = 0.25
+    scores_boost_latest: float = 0.05
+    strong_boost_rate: float = 0.75
+    weak_boost_rate: float = 1.5
+    min_pos_scores_rate: float = 0.5
+    max_index: int = 99999
 
     def __post_init__(self, **kwargs):
         if isinstance(self.encoder_config, dict):

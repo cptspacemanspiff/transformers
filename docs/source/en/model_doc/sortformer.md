@@ -37,10 +37,13 @@ diarization be trained with a simple per-frame binary objective and integrated d
 The model emits per-frame, per-speaker activity probabilities of shape `(batch_size, num_frames, num_speakers)`.
 Probabilities are obtained from the returned `logits` via `logits.sigmoid()`.
 
-This implementation covers the **offline** (full-sequence) forward path. The original streaming inference with the
-Arrival-Order Speaker Cache (AOSC) is not yet ported.
+Both the **offline** (full-sequence) forward path and the **streaming** inference path with the Arrival-Order Speaker
+Cache (AOSC) are supported. Streaming reuses the same weights but processes the audio in fixed-size chunks, keeping a
+bounded speaker cache so that memory and compute stay constant regardless of recording length.
 
 ## Usage
+
+### Offline (full-sequence)
 
 ```python
 import torch
@@ -59,6 +62,25 @@ with torch.no_grad():
 speaker_probs = logits.sigmoid()  # (batch, num_frames, num_speakers)
 speaker_active = speaker_probs > 0.5
 ```
+
+### Streaming (Arrival-Order Speaker Cache)
+
+[`~SortformerForAudioFrameClassification.diarize_streaming`] runs the chunked loop internally and returns the
+per-frame speaker probabilities directly (already `sigmoid`-activated). Unlike the offline path, the streaming path
+should be fed features extracted **without** waveform peak-normalization.
+
+```python
+with torch.no_grad():
+    speaker_probs = model.diarize_streaming(inputs.input_features, attention_mask=inputs.attention_mask)
+```
+
+For true incremental / real-time use, drive the steps yourself with the explicit streaming state (the analog of a
+generation cache), which is created by [`~SortformerForAudioFrameClassification.init_streaming_state`] and threaded
+through each [`~SortformerForAudioFrameClassification.streaming_step`] call. The chunking and cache hyperparameters
+(`chunk_len`, `spkcache_len`, `fifo_len`, …) are configurable on [`SortformerConfig`].
+
+A runnable example that plots the diarization result (with an optional `--streaming` flag) lives at
+`examples/pytorch/speaker-diarization/run_sortformer_diarization.py`.
 
 Checkpoints in the original NeMo `.nemo` format can be converted with
 `src/transformers/models/sortformer/convert_sortformer_nemo_to_hf.py`.
@@ -80,3 +102,10 @@ Checkpoints in the original NeMo `.nemo` format can be converted with
 
 [[autodoc]] SortformerForAudioFrameClassification
     - forward
+    - diarize_streaming
+    - streaming_step
+    - init_streaming_state
+
+## SortformerStreamingState
+
+[[autodoc]] SortformerStreamingState

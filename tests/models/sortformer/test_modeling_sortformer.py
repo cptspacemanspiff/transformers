@@ -357,3 +357,51 @@ class SortformerIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(num_active, 2, f"Expected at least 2 active speakers, got {num_active}")
         overlap_frames = int(((hf_preds[0] > 0.5).sum(dim=-1) >= 2).sum().item())
         self.assertGreater(overlap_frames, 0, "Expected the model to produce overlapping (>=2 speaker) frames")
+
+    @unittest.skipUnless(
+        _nemo_available and _soundfile_available,
+        "nemo_toolkit and soundfile are required",
+    )
+    def test_streaming_parity_with_nemo(self):
+        """Numerical parity of the HF streaming path (`diarize_streaming`, the Arrival-Order Speaker Cache) against
+        NeMo's synchronous `forward_streaming`.
+
+        Identical mel features are fed to both so this isolates the chunked encoder + AOSC update/compression logic.
+        The 27s 4-speaker fixture spans two chunks, so the speaker cache overflows `spkcache_len` and is compressed at
+        least once. Unlike the offline path, streaming does **not** peak-normalize the waveform.
+        """
+        import soundfile as sf
+        from huggingface_hub import hf_hub_download, list_repo_files
+        from nemo.collections.asr.models import SortformerEncLabelModel
+
+        audio, sampling_rate = sf.read(os.path.join(_FIXTURES_DIR, "mixture_4spk_overlap.wav"))
+        self.assertEqual(sampling_rate, 16000)
+
+        nemo_file = next(f for f in list_repo_files(_STREAMING_REPO) if f.endswith(".nemo"))
+        nemo_path = hf_hub_download(repo_id=_STREAMING_REPO, filename=nemo_file)
+        nemo_model = SortformerEncLabelModel.restore_from(nemo_path, map_location="cpu").eval()
+        nemo_model.streaming_mode = True  # enable the chunked streaming path
+
+        hf_model = SortformerForAudioFrameClassification.from_pretrained(self.hf_path).eval()
+
+        audio = torch.tensor(audio, dtype=torch.float32)[None, :]
+        audio_len = torch.tensor([audio.shape[1]])
+
+        with torch.no_grad():
+            # NeMo streaming: process_signal does NOT peak-normalize in streaming_mode.
+            processed_signal, processed_len = nemo_model.process_signal(audio, audio_len)
+            processed_signal = processed_signal[:, :, : processed_len.max()]
+            nemo_preds = nemo_model.forward_streaming(processed_signal, processed_len)
+
+            # HF: feed identical features into the streaming wrapper.
+            input_features = processed_signal.transpose(1, 2)
+            attn = (torch.arange(input_features.shape[1])[None, :] < processed_len[:, None]).long()
+            hf_preds = hf_model.diarize_streaming(input_features, attention_mask=attn)
+
+        self.assertEqual(hf_preds.shape, nemo_preds.shape)
+        max_abs = (nemo_preds - hf_preds).abs().max().item()
+        # Bit-exact in practice (~6e-7); tolerance only covers float32 rounding in the encoder/AOSC tensor ops.
+        self.assertLess(max_abs, 1e-4, f"Streaming parity with NeMo failed: max|Δ|={max_abs:.3e}")
+
+        # The cache must have been compressed at least once (two chunks, cache cap 188 < 338 total frames).
+        self.assertGreater(nemo_preds.shape[1], hf_model.config.spkcache_len)
