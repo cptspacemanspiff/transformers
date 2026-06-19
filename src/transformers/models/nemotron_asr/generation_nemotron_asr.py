@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass, field
+
 import torch
 
 from ..parakeet.generation_parakeet import ParakeetRNNTDecoderCache, ParakeetRNNTGenerationMixin
@@ -19,6 +21,34 @@ from ..parakeet.generation_parakeet import ParakeetRNNTDecoderCache, ParakeetRNN
 
 class NemotronAsrRNNTDecoderCache(ParakeetRNNTDecoderCache):
     pass
+
+
+@dataclass
+class NemotronAsrStreamingCache:
+    """Mutable state carried across [`NemotronAsrForRNNT.streaming_step`] calls for cache-aware streaming.
+
+    It holds the per-layer encoder caches (the attention left-context and the convolution left-context that NeMo's
+    `cache_last_channel` / `cache_last_time` store), the subsampling left-context mel frames, and the RNN-T decoder
+    state (LSTM hidden/cell + last emitted token), so that each streaming step processes only the new audio chunk.
+
+    Attributes:
+        last_channel (`list[torch.FloatTensor]`): per-layer attention input cache, each `(batch, cache_len, hidden)`.
+        last_time (`list[torch.FloatTensor]`): per-layer causal-conv cache, each `(batch, hidden, kernel - 1)`.
+        last_channel_len (`int`): number of valid (filled) frames currently in `last_channel`.
+        pre_encode (`torch.FloatTensor`): trailing mel frames `(batch, pre_encode_frames, num_mel_bins)` carried over
+            to give the causal subsampling its left context on the next chunk.
+        decoder_cache (`NemotronAsrRNNTDecoderCache`): RNN-T prediction-network LSTM state.
+        last_token (`torch.LongTensor`): the last non-blank token emitted per batch element, `(batch, 1)`.
+        finished (`bool`): set once a terminating step has been processed.
+    """
+
+    last_channel: list = field(default_factory=list)
+    last_time: list = field(default_factory=list)
+    last_channel_len: int = 0
+    pre_encode: torch.FloatTensor | None = None
+    decoder_cache: NemotronAsrRNNTDecoderCache | None = None
+    last_token: torch.LongTensor | None = None
+    finished: bool = False
 
 
 class NemotronAsrRNNTGenerationMixin(ParakeetRNNTGenerationMixin):
@@ -63,4 +93,4 @@ class NemotronAsrRNNTGenerationMixin(ParakeetRNNTGenerationMixin):
         return inputs, input_name, model_kwargs
 
 
-__all__ = ["NemotronAsrRNNTDecoderCache", "NemotronAsrRNNTGenerationMixin"]
+__all__ = ["NemotronAsrRNNTDecoderCache", "NemotronAsrRNNTGenerationMixin", "NemotronAsrStreamingCache"]

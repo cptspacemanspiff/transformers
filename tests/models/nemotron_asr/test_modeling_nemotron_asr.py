@@ -373,6 +373,72 @@ class NemotronAsrModelBehaviorTest(unittest.TestCase):
         max_abs = (out_padded[:, :s1] - out_clean).abs().max().item()
         self.assertLess(max_abs, 1e-5, f"Padding leaked into valid frames: max|Δ|={max_abs:.3e}")
 
+    def _drive_streaming_encoder(self, encoder, features):
+        """Run the cache-aware encoder over `features` using its NeMo-style chunk schedule; return concatenated out."""
+        scfg = encoder.streaming_config
+        n_layers = encoder.config.num_hidden_layers
+        hidden = encoder.config.hidden_size
+        last_channel = [
+            torch.zeros(1, scfg["last_channel_cache_size"], hidden, device=features.device) for _ in range(n_layers)
+        ]
+        last_time = [torch.zeros(1, hidden, scfg["conv_cache_size"], device=features.device) for _ in range(n_layers)]
+        clen, pos, step, outs = 0, 0, 0, []
+        total = features.shape[1]
+        while pos < total:
+            if step == 0:
+                window, drop = features[:, : scfg["first_chunk_mel"]], 0
+                pos = scfg["first_chunk_mel"]
+            else:
+                end = min(pos + scfg["chunk_mel"], total)
+                window, drop = features[:, pos - scfg["pre_encode_frames"] : end], scfg["drop_extra_pre_encoded"]
+                pos = end
+            emb, last_channel, last_time, clen = encoder.streaming_forward(window, last_channel, last_time, clen, drop)
+            outs.append(emb)
+            step += 1
+        return torch.cat(outs, dim=1)
+
+    def test_streaming_encoder_matches_offline(self):
+        """Cache-aware streaming must produce the same encoder output, frame-for-frame, as a single offline pass.
+
+        This is the core streaming correctness property: the per-layer attention/conv caches reconstruct exactly the
+        left context an offline forward would recompute (requires `att_context_size[0]` to be chunk-aligned).
+        """
+        config = NemotronAsrEncoderConfig(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=64,
+            subsampling_conv_channels=16,
+            num_mel_bins=128,
+            dropout=0.0,
+            layerdrop=0.0,
+            att_context_size=[16, 3],
+        )
+        encoder = NemotronAsrEncoder(config).to(torch_device).eval()
+        torch.manual_seed(0)
+        features = torch.randn(1, 25 + 32 * 4, config.num_mel_bins, device=torch_device)
+        with torch.no_grad():
+            offline = encoder(input_features=features).last_hidden_state
+            streamed = self._drive_streaming_encoder(encoder, features)
+        n = min(offline.shape[1], streamed.shape[1])
+        self.assertGreater(n, 0)
+        max_abs = (offline[:, :n] - streamed[:, :n]).abs().max().item()
+        self.assertLess(max_abs, 1e-4, f"Streaming encoder diverged from offline: max|Δ|={max_abs:.3e}")
+
+    def test_streaming_decode_matches_offline_generate(self):
+        """Greedy RNN-T streaming decode must emit the same token sequence as the offline `generate` path."""
+        config = NemotronAsrForRNNTModelTester(self).get_config()
+        model = NemotronAsrForRNNT(config).to(torch_device).eval()
+        model.generation_config.decoder_start_token_id = config.blank_token_id
+        torch.manual_seed(0)
+        features = torch.randn(1, 25 + 32 * 4, config.encoder_config.num_mel_bins, device=torch_device)
+        prompt_indices = torch.tensor([0], device=torch_device)
+        with torch.no_grad():
+            offline = model.generate(input_features=features, prompt_indices=prompt_indices, max_new_tokens=200)
+            offline_tokens = [t for t in offline.sequences[0].tolist() if t != config.blank_token_id]
+            stream_tokens = model.transcribe_stream(features, prompt_indices=prompt_indices)[0]
+        self.assertEqual(stream_tokens, offline_tokens)
+
 
 @require_torch
 @slow
@@ -463,3 +529,59 @@ class NemotronAsrIntegrationTest(unittest.TestCase):
             hf_text = processor.batch_decode(output.sequences, skip_special_tokens=True)[0]
 
         self.assertEqual(hf_text, nemo_text)
+
+    @unittest.skipUnless(
+        _nemo_prompt_available and _soundfile_available, "nemo_toolkit (prompt RNN-T) and soundfile are required"
+    )
+    def test_streaming_forward_parity_with_nemo(self):
+        """Per-chunk cache-aware streaming parity: HF `streaming_forward` must match NeMo's `cache_aware_stream_step`
+        encoder output on every chunk of a real utterance, with the per-layer attention/conv caches threaded through.
+        """
+        import urllib.request
+
+        from huggingface_hub import hf_hub_download, list_repo_files
+        from nemo.collections.asr.models import ASRModel
+        from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
+
+        nemo_file = next(f for f in list_repo_files(_NEMO_REPO) if f.endswith(".nemo"))
+        nemo_path = hf_hub_download(repo_id=_NEMO_REPO, filename=nemo_file)
+        nemo_model = ASRModel.restore_from(nemo_path, map_location="cpu").eval()
+        nemo_model.encoder.set_default_att_context_size(self.att_context_size)
+        nemo_model.encoder.setup_streaming_params()
+
+        hf_model = NemotronAsrForRNNT.from_pretrained(self.hf_path).eval()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = os.path.join(tmp, "sample.wav")
+            urllib.request.urlretrieve("https://cdn-media.huggingface.co/speech_samples/sample1.flac", wav_path)
+            buf = CacheAwareStreamingAudioBuffer(model=nemo_model, online_normalization=False)
+            buf.append_audio_file(wav_path, stream_id=-1)
+
+            cache_channel, cache_time, cache_len = nemo_model.encoder.get_initial_cache_state(batch_size=1)
+            hf_cache = hf_model.init_streaming_state(1)
+            worst = 0.0
+            with torch.no_grad():
+                for step, (chunk, chunk_len) in enumerate(buf):
+                    drop = nemo_model.encoder.streaming_cfg.drop_extra_pre_encoded if step != 0 else 0
+                    enc, _, cache_channel, cache_time, cache_len = nemo_model.encoder.cache_aware_stream_step(
+                        processed_signal=chunk,
+                        processed_signal_length=chunk_len,
+                        cache_last_channel=cache_channel,
+                        cache_last_time=cache_time,
+                        cache_last_channel_len=cache_len,
+                        keep_all_outputs=buf.is_buffer_empty(),
+                        drop_extra_pre_encoded=drop,
+                    )
+                    nemo_enc = enc.transpose(1, 2)
+                    hf_enc, hf_cache.last_channel, hf_cache.last_time, hf_cache.last_channel_len = (
+                        hf_model.encoder.streaming_forward(
+                            chunk.transpose(1, 2),
+                            hf_cache.last_channel,
+                            hf_cache.last_time,
+                            hf_cache.last_channel_len,
+                            drop,
+                        )
+                    )
+                    n = min(nemo_enc.shape[1], hf_enc.shape[1])
+                    worst = max(worst, (nemo_enc[:, :n] - hf_enc[:, :n]).abs().max().item())
+        self.assertLess(worst, 1e-3, f"Streaming forward parity with NeMo failed: worst max|Δ|={worst:.3e}")

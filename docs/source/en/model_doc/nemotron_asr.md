@@ -69,6 +69,29 @@ print(processor.batch_decode(output.sequences, skip_special_tokens=True))
 Convert an original NeMo `.nemo` checkpoint with
 `src/transformers/models/nemotron_asr/convert_nemotron_asr_nemo_to_hf.py`.
 
+### Cache-aware streaming
+
+The model also supports genuine cache-aware streaming: each step consumes only a new audio chunk and reuses cached
+encoder context (per-layer attention and convolution caches), so there is no overlapping recomputation. The latency
+is set by `att_context_size = [left, right]` (in 80 ms frames); e.g. `[56, 0]` is 80 ms and `[56, 13]` is 1.12 s.
+
+```python
+import torch
+from transformers import AutoProcessor, NemotronAsrForRNNT
+
+model = NemotronAsrForRNNT.from_pretrained("nvidia/nemotron-3.5-asr-streaming-0.6b").eval()
+processor = AutoProcessor.from_pretrained("nvidia/nemotron-3.5-asr-streaming-0.6b")
+
+inputs = processor(audio_array, sampling_rate=16000, target_lang="en-US", return_tensors="pt")
+# convenience driver: chunk internally and return emitted token ids per batch element
+token_ids = model.transcribe_stream(inputs["input_features"], prompt_indices=inputs["prompt_indices"])
+print(processor.tokenizer.decode(token_ids[0], skip_special_tokens=True))
+```
+
+For a real per-chunk stream, drive it manually with [`~NemotronAsrForRNNT.init_streaming_state`] and
+[`~NemotronAsrForRNNT.streaming_step`], threading the returned `NemotronAsrStreamingCache` from one chunk to the
+next. The streaming output is numerically identical (frame-for-frame) to the offline forward.
+
 ## NemotronAsrConfig
 
 [[autodoc]] NemotronAsrConfig
