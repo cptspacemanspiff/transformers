@@ -16,18 +16,29 @@ Run Sortformer speaker diarization on an audio file and plot the result.
 
 Sortformer is an end-to-end diarization model that emits, for every ~80 ms output frame, an independent probability
 for each of up to `num_speakers` speakers being active (multi-label / sigmoid), so it naturally handles overlapping
-speech. This example runs the (offline) forward pass and renders a diarization figure.
+speech. This example runs diarization in one of three modes and renders a diarization figure:
 
-Example:
+* offline (default)        -- the bidirectional full-sequence forward pass (peak-normalized waveform);
+* `--streaming`            -- chunked Arrival-Order Speaker Cache streaming, re-encoded bidirectionally per step;
+* `--streaming --causal`   -- the same streaming bookkeeping but with the chunked-limited `[-1, R]` mask, so each frame
+                              sees only the past plus `--right-context R` frames of look-ahead (the realistic
+                              low-latency behaviour). It is *not* strictly causal: R=7 is ~0.56 s of look-ahead.
+
+Examples:
 
 ```bash
+# offline
 python examples/pytorch/speaker-diarization/run_sortformer_diarization.py \
     --model nvidia/diar_streaming_sortformer_4spk-v2-hf \
+    --audio tests/fixtures/sortformer/mixture_4spk_overlap.wav --output diarization.png
+
+# causal streaming, overlaying the full-attention ceiling to see how much the look-ahead is buying
+python examples/pytorch/speaker-diarization/run_sortformer_diarization.py \
     --audio tests/fixtures/sortformer/mixture_4spk_overlap.wav \
-    --output diarization.png
+    --streaming --causal --right-context 7 --compare-full --output diarization.png
 ```
 
-Requires: `pip install soundfile librosa matplotlib`.
+Requires: `pip install soundfile librosa matplotlib`. The streaming path does not peak-normalize the waveform.
 """
 
 import argparse
@@ -48,7 +59,7 @@ from transformers import AutoFeatureExtractor, AutoModelForAudioFrameClassificat
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run Sortformer diarization and plot speaker activity.")
-    parser.add_argument("--model", default="nvidia/diar_streaming_sortformer_4spk-v2-hf", help="HF model id or path.")
+    parser.add_argument("--model", default="cptspacemanspiff/diar_streaming_sortformer_4spk-v2-hf", help="HF model id or path.")
     parser.add_argument("--audio", required=True, help="Path to a mono 16 kHz wav file.")
     parser.add_argument("--output", default="diarization.png", help="Where to write the plot.")
     parser.add_argument("--threshold", type=float, default=0.5, help="Probability threshold for activity.")
@@ -62,6 +73,24 @@ def parse_args():
         action="store_true",
         help="Run chunked streaming diarization (Arrival-Order Speaker Cache) instead of the offline forward pass. "
         "The streaming path does not peak-normalize the waveform.",
+    )
+    parser.add_argument(
+        "--causal",
+        action="store_true",
+        help="With --streaming, use the chunked-limited causal mask (past + --right-context look-ahead) instead of "
+        "bidirectional re-encode -- the realistic low-latency path.",
+    )
+    parser.add_argument(
+        "--right-context",
+        type=int,
+        default=7,
+        help="Causal-mask look-ahead R (frames); each frame sees up to R (~R*80 ms) future frames. Used with --causal.",
+    )
+    parser.add_argument(
+        "--compare-full",
+        action="store_true",
+        help="With --streaming --causal, also run the bidirectional full-attention path and overlay it (the quality "
+        "ceiling) as dotted curves.",
     )
     return parser.parse_args()
 
@@ -94,6 +123,10 @@ def main():
 
     feature_extractor = AutoFeatureExtractor.from_pretrained(args.model)
     model = AutoModelForAudioFrameClassification.from_pretrained(args.model).eval()
+    if args.streaming and args.causal:
+        # Window each chunk with the same look-ahead the causal mask uses, so --right-context controls it coherently
+        # (and the --compare-full overlay sees the identical window, isolating mask vs full attention).
+        model.config.chunk_right_context = args.right_context
 
     audio = load_audio(args.audio, feature_extractor.sampling_rate)
     # The offline forward path peak-normalizes the waveform before feature extraction; the streaming path does not.
@@ -101,10 +134,18 @@ def main():
         audio = audio / (np.abs(audio).max() + 1e-3)
 
     inputs = feature_extractor(audio, sampling_rate=feature_extractor.sampling_rate, return_tensors="pt")
+    full = None  # optional full-attention overlay (the bidirectional ceiling) for --compare-full
     with torch.no_grad():
         if args.streaming:
             # Chunked streaming inference (Arrival-Order Speaker Cache); returns sigmoid probabilities directly.
-            probs = model.diarize_streaming(inputs.input_features, attention_mask=inputs.attention_mask)[0].numpy()
+            probs = model.diarize_streaming(
+                inputs.input_features,
+                attention_mask=inputs.attention_mask,
+                causal=args.causal,
+                right_context=args.right_context,
+            )[0].numpy()
+            if args.causal and args.compare_full:
+                full = model.diarize_streaming(inputs.input_features, attention_mask=inputs.attention_mask)[0].numpy()
         else:
             # logits: (batch, num_frames, num_speakers); probabilities via sigmoid (multi-label).
             probs = model(**inputs).logits.sigmoid()[0].numpy()
@@ -124,6 +165,10 @@ def main():
             continue
         pretty = ", ".join(f"{a:.1f}-{b:.1f}s" for a, b in segments)
         print(f"  speaker {spk}: {pretty}")
+    if full is not None:
+        n = min(len(probs), len(full))
+        set_match = ((probs[:n] > args.threshold) == (full[:n] > args.threshold)).all(axis=1).mean()
+        print(f"causal vs full-attention: mean|Δ|={np.abs(probs[:n] - full[:n]).mean():.3f}  set match={set_match * 100:.1f}%")
 
     # Optional ground-truth overlay if a sibling <name>.json manifest exists (e.g. the test fixture).
     gt_path = os.path.splitext(args.audio)[0] + ".json"
@@ -135,16 +180,27 @@ def main():
         2, 1, figsize=(11, 2 + 0.9 * num_speakers), sharex=True, height_ratios=[2, 1]
     )
 
-    # Top panel: per-speaker probability curves with shaded active regions.
+    # Top panel: per-speaker probability curves with shaded active regions; full-attention ceiling as dotted lines.
     for spk in range(num_speakers):
         ax_prob.plot(times, probs[:, spk], color=colors(spk), label=f"speaker {spk}")
         ax_prob.fill_between(
             times, 0, probs[:, spk], where=probs[:, spk] > args.threshold, color=colors(spk), alpha=0.2
         )
+        if full is not None:
+            ax_prob.plot(times[: len(full)], full[: len(times), spk], color=colors(spk), ls=":", lw=0.9, alpha=0.7)
     ax_prob.axhline(args.threshold, ls="--", lw=0.8, color="gray")
     ax_prob.set_ylim(0, 1)
     ax_prob.set_ylabel("P(active)")
-    ax_prob.set_title(f"Sortformer diarization — {os.path.basename(args.audio)}")
+    if args.streaming and args.causal:
+        mode = f"causal streaming (R={args.right_context})"
+    elif args.streaming:
+        mode = "streaming"
+    else:
+        mode = "offline"
+    title = f"Sortformer {mode} — {os.path.basename(args.audio)}"
+    if full is not None:
+        title += "   [dotted = full-attention ceiling]"
+    ax_prob.set_title(title)
     ax_prob.legend(loc="upper right", ncol=num_speakers, fontsize=8)
 
     # Bottom panel: predicted activity ribbons (solid) and ground truth (hatched) per speaker.

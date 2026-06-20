@@ -52,7 +52,7 @@ from transformers import AutoFeatureExtractor, AutoModelForAudioFrameClassificat
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Real-time Sortformer diarization from a microphone.")
-    parser.add_argument("--model", default="nvidia/diar_streaming_sortformer_4spk-v2", help="HF model id or path.")
+    parser.add_argument("--model", default="cptspacemanspiff/diar_streaming_sortformer_4spk-v2", help="HF model id or path.")
     parser.add_argument(
         "--chunk-seconds",
         type=float,
