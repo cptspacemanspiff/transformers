@@ -32,6 +32,15 @@ if is_torch_available():
     import torch
 
     from transformers import SortformerFeatureExtractor, SortformerForAudioFrameClassification, SortformerModel
+    from transformers.cache_utils import (
+        Cache,
+        DynamicCache,
+        StaticLayer,
+    )
+    from transformers.conv_cache_utils import (
+        DynamicConvCache,
+        StaticConvCache,
+    )
 
 
 _nemo_available = importlib.util.find_spec("nemo") is not None
@@ -246,13 +255,277 @@ class SortformerStreamingConformerTest(unittest.TestCase):
         attention_mask[1, 8 * 30 :] = 0
         with torch.no_grad():
             ref = sortformer.encoder(features, attention_mask=attention_mask)
-            hidden_states, output_mask, updated_cache = sortformer._conformer_forward(
-                features, attention_mask=attention_mask, cache=None, causal=False
+            hidden_states, output_mask, past_key_values, conv_cache = sortformer._conformer_forward(
+                features, attention_mask=attention_mask, past_key_values=None, causal=False
             )
-        self.assertIsNone(updated_cache)
+        self.assertIsNone(past_key_values)
+        self.assertIsNone(conv_cache)
         self.assertEqual(hidden_states.shape, ref.last_hidden_state.shape)
         self.assertLess((hidden_states - ref.last_hidden_state).abs().max().item(), 1e-5)
         self.assertTrue(torch.equal(output_mask, ref.attention_mask))
+
+    def _static_caches(self, config, total_frames, batch_size=1):
+        """Build a (StaticCache-style attention cache, StaticConvCache) pair sized for `total_frames` frames."""
+        enc = config.encoder_config
+        attention_cache = Cache(layers=[StaticLayer(max_cache_len=total_frames) for _ in range(enc.num_hidden_layers)])
+        conv_cache = StaticConvCache(
+            kernel_size=enc.conv_kernel_size,
+            num_layers=enc.num_hidden_layers,
+            channels=enc.hidden_size,
+            batch_size=batch_size,
+            device=torch_device,
+        )
+        return attention_cache, conv_cache
+
+    def test_conv_cache_dynamic_matches_static(self):
+        """`DynamicConvCache` and `StaticConvCache` must produce identical conv-ready windows on a random chunk stream,
+        and `StaticConvCache` must keep a fixed-shape `(B, C, kernel - 1)` buffer (export-friendly)."""
+        torch.manual_seed(0)
+        kernel_size, batch, channels = 9, 2, 16
+        dynamic = DynamicConvCache(kernel_size)
+        static = StaticConvCache(kernel_size=kernel_size, num_layers=1, channels=channels, batch_size=batch)
+        expected_ctx_shape = (batch, channels, kernel_size - 1)
+        max_abs = 0.0
+        for _ in range(8):
+            length = int(torch.randint(1, 12, (1,)).item())
+            chunk = torch.randn(batch, channels, length, device=torch_device)
+            out_dynamic = dynamic.update(chunk, 0)
+            out_static = static.update(chunk, 0)
+            self.assertEqual(out_dynamic.shape, (batch, channels, (kernel_size - 1) + length))
+            self.assertEqual(out_static.shape, out_dynamic.shape)
+            # The static buffer shape is constant across steps (no dynamic-shape allocation).
+            self.assertEqual(tuple(static.layers[0].conv_states.shape), expected_ctx_shape)
+            max_abs = max(max_abs, (out_dynamic - out_static).abs().max().item())
+        self.assertLess(max_abs, 1e-6)
+        self.assertEqual(dynamic.get_context_length(0), kernel_size - 1)
+        self.assertEqual(static.get_context_length(0), kernel_size - 1)
+
+    def test_streaming_dynamic_matches_static_caches(self):
+        """The cache-aware streaming encoder must give the same output with (DynamicCache, DynamicConvCache) as with
+        (StaticCache, StaticConvCache), so end users can swap in export-friendly caches."""
+        config, model = self._build_model()
+        torch.manual_seed(0)
+        sortformer = model.sortformer
+        features = torch.randn(1, 25 + 8 * 6, config.encoder_config.num_mel_bins, device=torch_device)
+        total_frames = sortformer.encoder.subsampling(features).shape[1]
+        with torch.no_grad():
+            dynamic_out = sortformer.streaming_encode(
+                features,
+                right_context=7,
+                chunk_size=8,
+                past_key_values=DynamicCache(),
+                conv_cache=DynamicConvCache(config.encoder_config.conv_kernel_size),
+            )
+            attention_cache, conv_cache = self._static_caches(config, total_frames)
+            static_out = sortformer.streaming_encode(
+                features, right_context=7, chunk_size=8, past_key_values=attention_cache, conv_cache=conv_cache
+            )
+        self.assertEqual(dynamic_out.shape, static_out.shape)
+        self.assertLess((dynamic_out - static_out).abs().max().item(), 1e-4)
+
+    def test_static_conv_cache_export_smoke(self):
+        """`StaticConvCache.update` must trace under `torch.export` with fixed-shape buffers and no dynamic-shape ops."""
+        kernel_size, batch, channels, chunk = 9, 1, 16, 8
+
+        class _ConvCacheModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.cache = StaticConvCache(
+                    kernel_size=kernel_size, num_layers=1, channels=channels, batch_size=batch
+                )
+
+            def forward(self, frames):
+                return self.cache.update(frames, 0)
+
+        module = _ConvCacheModule().eval()
+        example = torch.zeros(batch, channels, chunk)
+        exported = torch.export.export(module, (example,))
+        out = exported.module()(torch.randn(batch, channels, chunk))
+        self.assertEqual(tuple(out.shape), (batch, channels, (kernel_size - 1) + chunk))
+        self.assertEqual(tuple(module.cache.layers[0].conv_states.shape), (batch, channels, kernel_size - 1))
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Incremental-growth validation: feed the cache-aware streaming conformer ONE chunk at a time and assert the
+    # auto-growing KV cache and the final encoding match a single one-shot cache-aware pass.
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def _chunk_bounds(self, total_frames, step):
+        """Yield (start, end) frame ranges of width `step` covering `[0, total_frames)`."""
+        pos = 0
+        while pos < total_frames:
+            end = min(pos + step, total_frames)
+            yield pos, end
+            pos = end
+
+    def _random_init_static_attention(self, attention_cache, config, batch_size):
+        """Allocate the static attention K/V buffers and fill them with RANDOM garbage.
+
+        After this, every preallocated slot holds noise, so any slot the model must NOT attend to (the not-yet-written
+        tail beyond `kv_length`) is garbage rather than zeros. If the masking / `kv_length` slicing is wrong, the
+        streamed output will diverge from the dynamic/one-shot result.
+        """
+        enc = config.encoder_config
+        head_dim = enc.hidden_size // enc.num_attention_heads
+        attention_cache.early_initialization(
+            batch_size=batch_size,
+            num_heads=enc.num_attention_heads,
+            head_dim=head_dim,
+            dtype=torch.float32,
+            device=torch_device,
+        )
+        for layer in attention_cache.layers:
+            layer.keys.normal_()
+            layer.values.normal_()
+
+    def test_streaming_incremental_dynamic_autogrow_matches_one_shot(self):
+        """Task 2(a): feed a random feature sequence through the cache-aware streaming conformer ONE chunk at a time
+        using `DynamicCache` + `DynamicConvCache`. Assert the KV cache length grows by each chunk's frame count
+        (auto-grow), and the final concatenated encoding equals a single one-shot cache-aware pass over the whole
+        sequence (`max|d| < 1e-4`)."""
+        config, model = self._build_model()
+        torch.manual_seed(0)
+        sortformer = model.sortformer
+        right_context, chunk_size = 7, 8
+        features = torch.randn(1, 25 + 8 * 6, config.encoder_config.num_mel_bins, device=torch_device)
+
+        with torch.no_grad():
+            subsampled = sortformer.encoder.subsampling(features)
+            total_frames = subsampled.shape[1]
+
+            attention_cache = DynamicCache()
+            conv_cache = DynamicConvCache(config.encoder_config.conv_kernel_size)
+            outputs, expected_len = [], 0
+            for start, end in self._chunk_bounds(total_frames, chunk_size):
+                # KV length before this chunk == frames seen so far (auto-grow invariant).
+                self.assertEqual(int(attention_cache.get_seq_length()), expected_len)
+                hidden_states, _, attention_cache, conv_cache = sortformer._conformer_forward(
+                    subsampled[:, start:end],
+                    past_key_values=attention_cache,
+                    conv_cache=conv_cache,
+                    right_context=right_context,
+                )
+                expected_len += end - start
+                # The cache grew by exactly this chunk's frame count.
+                self.assertEqual(int(attention_cache.get_seq_length()), expected_len)
+                outputs.append(hidden_states)
+            streamed = torch.cat(outputs, dim=1)
+            self.assertEqual(int(attention_cache.get_seq_length()), total_frames)
+
+            one_shot = sortformer.streaming_encode(
+                features, right_context=right_context, chunk_size=100_000
+            )
+
+        self.assertEqual(streamed.shape, one_shot.shape)
+        self.assertLess((streamed - one_shot).abs().max().item(), 1e-4)
+
+    def test_streaming_incremental_static_random_init_masking(self):
+        """Task 2(b): same incremental feed but with `StaticCache` (preallocated `max_cache_len >= total_frames`) +
+        `StaticConvCache`, and with the static attention K/V buffers RANDOM-initialized before streaming. The streamed
+        result must still equal the dynamic/one-shot result (`max|d| < 1e-4`), proving the masking + `kv_length`
+        slicing correctly exclude the garbage (not-yet-written) region.
+
+        Conv-cache note: the conv left-pad (`kernel - 1` frames) is, by construction, semantically zero at `t = 0`
+        (the causal pad). The `StaticConvCache` buffer is fully overwritten by real frames after the first update and
+        has no maskable garbage region (its whole window always participates in the causal conv), so random-init of the
+        conv buffer is not meaningful; we therefore random-init only the *attention* preallocation, which is the path
+        with a maskable garbage region."""
+        config, model = self._build_model()
+        torch.manual_seed(0)
+        sortformer = model.sortformer
+        right_context, chunk_size = 7, 8
+        features = torch.randn(1, 25 + 8 * 6, config.encoder_config.num_mel_bins, device=torch_device)
+        batch_size = features.shape[0]
+
+        with torch.no_grad():
+            subsampled = sortformer.encoder.subsampling(features)
+            total_frames = subsampled.shape[1]
+            # Fixed growth limit strictly larger than the total frames, so there is always an unwritten garbage tail.
+            max_cache_len = total_frames + 11
+
+            # One-shot dynamic reference.
+            one_shot = sortformer.streaming_encode(
+                features, right_context=right_context, chunk_size=100_000
+            )
+
+            attention_cache = Cache(
+                layers=[
+                    StaticLayer(max_cache_len=max_cache_len)
+                    for _ in range(config.encoder_config.num_hidden_layers)
+                ]
+            )
+            self._random_init_static_attention(attention_cache, config, batch_size)
+            conv_cache = StaticConvCache(
+                kernel_size=config.encoder_config.conv_kernel_size,
+                num_layers=config.encoder_config.num_hidden_layers,
+                channels=config.encoder_config.hidden_size,
+                batch_size=batch_size,
+                device=torch_device,
+            )
+
+            outputs, expected_len = [], 0
+            for start, end in self._chunk_bounds(total_frames, chunk_size):
+                self.assertEqual(int(attention_cache.get_seq_length()), expected_len)
+                hidden_states, _, attention_cache, conv_cache = sortformer._conformer_forward(
+                    subsampled[:, start:end],
+                    past_key_values=attention_cache,
+                    conv_cache=conv_cache,
+                    right_context=right_context,
+                )
+                expected_len += end - start
+                self.assertEqual(int(attention_cache.get_seq_length()), expected_len)
+                outputs.append(hidden_states)
+            streamed = torch.cat(outputs, dim=1)
+
+        self.assertEqual(streamed.shape, one_shot.shape)
+        # The garbage-filled (masked) region did not leak into the output.
+        self.assertLess((streamed - one_shot).abs().max().item(), 1e-4)
+
+    def test_streaming_incremental_dynamic_equals_static_random_init(self):
+        """Task 2(c): pin `(DynamicCache, DynamicConvCache)` == `(StaticCache, StaticConvCache)` for the incremental
+        feed, with the static attention buffers RANDOM-initialized (`max|d| < 1e-4`)."""
+        config, model = self._build_model()
+        torch.manual_seed(0)
+        sortformer = model.sortformer
+        right_context, chunk_size = 7, 8
+        features = torch.randn(1, 25 + 8 * 6, config.encoder_config.num_mel_bins, device=torch_device)
+        batch_size = features.shape[0]
+
+        with torch.no_grad():
+            subsampled = sortformer.encoder.subsampling(features)
+            total_frames = subsampled.shape[1]
+
+            def run(attention_cache, conv_cache):
+                outputs = []
+                for start, end in self._chunk_bounds(total_frames, chunk_size):
+                    hidden_states, _, attention_cache, conv_cache = sortformer._conformer_forward(
+                        subsampled[:, start:end],
+                        past_key_values=attention_cache,
+                        conv_cache=conv_cache,
+                        right_context=right_context,
+                    )
+                    outputs.append(hidden_states)
+                return torch.cat(outputs, dim=1)
+
+            dynamic_out = run(DynamicCache(), DynamicConvCache(config.encoder_config.conv_kernel_size))
+
+            static_attention = Cache(
+                layers=[
+                    StaticLayer(max_cache_len=total_frames + 11)
+                    for _ in range(config.encoder_config.num_hidden_layers)
+                ]
+            )
+            self._random_init_static_attention(static_attention, config, batch_size)
+            static_conv = StaticConvCache(
+                kernel_size=config.encoder_config.conv_kernel_size,
+                num_layers=config.encoder_config.num_hidden_layers,
+                channels=config.encoder_config.hidden_size,
+                batch_size=batch_size,
+                device=torch_device,
+            )
+            static_out = run(static_attention, static_conv)
+
+        self.assertEqual(dynamic_out.shape, static_out.shape)
+        self.assertLess((dynamic_out - static_out).abs().max().item(), 1e-4)
 
 
 @require_torch
