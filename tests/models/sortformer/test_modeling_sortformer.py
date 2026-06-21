@@ -209,6 +209,53 @@ class SortformerModelTest(ModelTesterMixin, unittest.TestCase):
 
 
 @require_torch
+class SortformerStreamingConformerTest(unittest.TestCase):
+    """Cache-aware streaming of the FastConformer encoder (causal convs + growing attention cache)."""
+
+    def _build_model(self):
+        config = SortformerModelTester(self).get_config()
+        return config, SortformerForAudioFrameClassification(config).to(torch_device).eval()
+
+    def test_streaming_diarize_shape(self):
+        config, model = self._build_model()
+        features = floats_tensor([1, 25 + 8 * 5, config.encoder_config.num_mel_bins]).to(torch_device)
+        with torch.no_grad():
+            logits = model.streaming_diarize(features, right_context=7)
+        self.assertEqual(logits.shape[0], 1)
+        self.assertEqual(logits.shape[-1], config.num_speakers)
+
+    def test_streaming_matches_single_pass(self):
+        """Streaming in small chunks must equal one cache-aware pass over the whole sequence (cache correctness)."""
+        config, model = self._build_model()
+        torch.manual_seed(0)
+        features = torch.randn(1, 25 + 8 * 6, config.encoder_config.num_mel_bins, device=torch_device)
+        with torch.no_grad():
+            chunked = model.sortformer.streaming_encode(features, right_context=7, chunk_size=8)
+            one_shot = model.sortformer.streaming_encode(features, right_context=7, chunk_size=100_000)
+        self.assertEqual(chunked.shape, one_shot.shape)
+        self.assertLess((chunked - one_shot).abs().max().item(), 1e-4)
+
+    def test_offline_conformer_forward_matches_encoder(self):
+        """The single `_conformer_forward(cache=None, causal=False)` must reproduce `self.encoder(...)` exactly, so the
+        offline output is numerically unchanged by routing through the shared cache-aware forward."""
+        config, model = self._build_model()
+        torch.manual_seed(0)
+        sortformer = model.sortformer
+        features = torch.randn(2, 8 * 40, config.encoder_config.num_mel_bins, device=torch_device)
+        attention_mask = torch.ones(features.shape[0], features.shape[1], dtype=torch.long, device=torch_device)
+        attention_mask[1, 8 * 30 :] = 0
+        with torch.no_grad():
+            ref = sortformer.encoder(features, attention_mask=attention_mask)
+            hidden_states, output_mask, updated_cache = sortformer._conformer_forward(
+                features, attention_mask=attention_mask, cache=None, causal=False
+            )
+        self.assertIsNone(updated_cache)
+        self.assertEqual(hidden_states.shape, ref.last_hidden_state.shape)
+        self.assertLess((hidden_states - ref.last_hidden_state).abs().max().item(), 1e-5)
+        self.assertTrue(torch.equal(output_mask, ref.attention_mask))
+
+
+@require_torch
 @slow
 class SortformerIntegrationTest(unittest.TestCase):
     """Numerical-parity test of the converted HF model against the original NeMo model.

@@ -263,14 +263,103 @@ class SortformerPreTrainedModel(PreTrainedModel):
     # raw `tensor.data.normal_()` — that bypasses the guard and clobbers weights loaded by `from_pretrained`.
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# Cache-aware streaming of the FastConformer encoder layers.
+#
+# The same FastConformer (Parakeet) layers are run in one of two modes by `SortformerModel._conformer_forward`:
+#   * offline (`cache is None`): the standard `ParakeetEncoderBlock.forward` over the whole window (optionally with the
+#     chunked-limited causal mask). This is the offline / full-re-encode path and is numerically unchanged.
+#   * streaming (`cache is not None`): the block math is inlined, but attention reads/writes a growing projected K/V
+#     cache and the depthwise convolution is made causal with a left-context cache. Each query frame attends to the
+#     whole past plus `right_context` look-ahead frames within its own `(right_context + 1)`-frame chunk.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+@dataclass
+class SortformerStreamingConformerState:
+    """Per-layer cache for cache-aware streaming of the FastConformer encoder layers.
+
+    The attention cache stores the already-**projected** keys/values (a true KV cache): each step only projects the
+    new chunk's frames and appends them, instead of re-projecting the whole history. Because `k_proj`/`v_proj` are
+    position-wise linear, this is numerically identical to re-projecting `[cache, new]` every step.
+
+    Attributes:
+        key_cache (`list[torch.FloatTensor]`): per-layer projected keys `(batch, num_heads, cache_len, head_dim)`,
+            growing unboundedly so the model attends to the entire past.
+        value_cache (`list[torch.FloatTensor]`): per-layer projected values `(batch, num_heads, cache_len, head_dim)`.
+        last_time (`list[torch.FloatTensor]`): per-layer causal-conv left context `(batch, d_model, kernel - 1)`.
+        offset (`int`): absolute index (in subsampled frames) of the next chunk, used for chunk-boundary alignment.
+    """
+
+    key_cache: list
+    value_cache: list
+    last_time: list
+    offset: int = 0
+
+
+def _conformer_streaming_attention(
+    attention, hidden_states, position_embeddings, key_cache, value_cache, attention_mask
+):
+    """Relative-position self-attention with a projected key/value cache, on a single streaming chunk.
+
+    `hidden_states` are the new query frames; `key_cache`/`value_cache` hold the projected keys/values from all past
+    frames `(batch, num_heads, cache_len, head_dim)`. Only the new frames are projected and appended. Returns the
+    attention output plus the updated key/value caches.
+    """
+    batch_size, query_length = hidden_states.shape[:2]
+    num_heads, head_dim = attention.config.num_attention_heads, attention.head_dim
+    hidden_shape = (batch_size, query_length, num_heads, head_dim)
+
+    query_states = attention.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = torch.cat([key_cache, attention.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)], dim=2)
+    value_states = torch.cat([value_cache, attention.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)], dim=2)
+    kv_length = key_states.shape[2]
+
+    query_with_bias_u = query_states + attention.bias_u.view(1, num_heads, 1, head_dim)
+    query_with_bias_v = query_states + attention.bias_v.view(1, num_heads, 1, head_dim)
+
+    relative_key_states = attention.relative_k_proj(position_embeddings).view(batch_size, -1, num_heads, head_dim)
+    matrix_bd = query_with_bias_v @ relative_key_states.permute(0, 2, 3, 1)
+    matrix_bd = attention._rel_shift(matrix_bd)[..., :kv_length]
+    matrix_ac = query_with_bias_u @ key_states.transpose(-2, -1)
+
+    scores = (matrix_ac + matrix_bd) * attention.scaling
+    scores = scores.masked_fill(attention_mask[:, None].logical_not(), torch.finfo(scores.dtype).min)
+    attn_weights = scores.softmax(dim=-1)
+    attn_output = (attn_weights @ value_states).transpose(1, 2).reshape(batch_size, query_length, -1)
+    return attention.o_proj(attn_output), key_states, value_states
+
+
+def _conformer_streaming_conv(conv_module, hidden_states, cache, left_padding):
+    """Causal depthwise convolution on one streaming chunk, using `cache` (the previous `kernel - 1` input frames).
+
+    Runs the offline `ParakeetEncoderConvolutionModule` weights with left-only padding (the cache) instead of the
+    symmetric padding the module normally applies.
+    """
+    hidden_states = hidden_states.transpose(1, 2)  # (B, C, n)
+    hidden_states = conv_module.pointwise_conv1(hidden_states)
+    hidden_states = nn.functional.glu(hidden_states, dim=1)
+
+    combined = torch.cat([cache, hidden_states], dim=-1)
+    new_cache = combined[:, :, -left_padding:]
+    hidden_states = nn.functional.conv1d(
+        combined,
+        conv_module.depthwise_conv.weight,
+        conv_module.depthwise_conv.bias,
+        groups=conv_module.depthwise_conv.groups,
+    )
+    hidden_states = conv_module.norm(hidden_states)  # BatchNorm1d, in eval uses running statistics
+    hidden_states = conv_module.activation(hidden_states)
+    hidden_states = conv_module.pointwise_conv2(hidden_states)
+    return hidden_states.transpose(1, 2), new_cache
+
+
 @auto_docstring(
     custom_intro="""
     The bare Sortformer model: a FastConformer acoustic encoder followed by a post-LN Transformer encoder, producing
     per-frame hidden states.
     """
 )
-
-
 class SortformerModel(SortformerPreTrainedModel):
     def __init__(self, config: SortformerConfig):
         super().__init__(config)
@@ -295,9 +384,7 @@ class SortformerModel(SortformerPreTrainedModel):
         input_features (`torch.FloatTensor` of shape `(batch_size, num_frames, num_mel_bins)`):
             Log-mel filterbank features extracted from the raw waveform by [`SortformerFeatureExtractor`].
         """
-        encoder_outputs = self.encoder(input_features, attention_mask=attention_mask)
-        hidden_states = encoder_outputs.last_hidden_state
-        frame_mask = encoder_outputs.attention_mask
+        hidden_states, frame_mask, _ = self._conformer_forward(input_features, attention_mask=attention_mask)
 
         if self.encoder_proj is not None:
             hidden_states = self.encoder_proj(hidden_states)
@@ -311,6 +398,174 @@ class SortformerModel(SortformerPreTrainedModel):
         hidden_states = self.transformer_encoder(hidden_states, additive_mask)
 
         return SortformerModelOutput(last_hidden_state=hidden_states, attention_mask=frame_mask)
+
+    @staticmethod
+    def _length_to_mask(lengths: torch.Tensor, max_length: int) -> torch.Tensor:
+        arange = torch.arange(max_length, device=lengths.device)
+        return arange.expand(lengths.shape[0], max_length) < lengths.unsqueeze(1)
+
+    def _conformer_forward(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        cache: SortformerStreamingConformerState | None = None,
+        causal: bool = False,
+        right_context: int = 7,
+    ):
+        """Single FastConformer-encoder forward shared by the offline and cache-aware streaming paths.
+
+        The convolutional subsampling is always run once up front (its weights are non-causal). The `num_hidden_layers`
+        conformer layers are then run in one of two modes:
+
+        * `cache is None` (offline / full re-encode): the standard `ParakeetEncoderBlock.forward` over the whole window,
+          bidirectional when `causal=False`, or restricted to the chunked-limited `[-1, right_context]` mask when
+          `causal=True`. This is numerically identical to `self.encoder(...)` followed by no caching.
+        * `cache is not None` (cache-aware streaming): the block math is inlined, reading/writing the per-layer projected
+          K/V cache and the causal-conv left-context cache in `cache`. Each query frame attends to the whole past plus
+          `right_context` look-ahead frames within its own `(right_context + 1)`-frame chunk.
+
+        Returns `(hidden_states, output_mask, updated_cache)` where `output_mask` is the subsampled frame mask (or
+        `None` when no input mask was given) and `updated_cache` is the mutated `cache` (or `None` in offline mode).
+        """
+        encoder = self.encoder
+
+        if cache is None:
+            hidden_states = encoder.subsampling(input_features, attention_mask)
+            hidden_states = hidden_states * encoder.input_scale
+            position_embeddings = encoder.encode_positions(hidden_states)
+            hidden_states = nn.functional.dropout(hidden_states, p=encoder.dropout, training=self.training)
+            position_embeddings = nn.functional.dropout(
+                position_embeddings, p=encoder.dropout_positions, training=self.training
+            )
+
+            seq_len = hidden_states.shape[1]
+            output_mask = None
+            attn_keep = None
+            if attention_mask is not None:
+                output_mask = encoder._get_output_attention_mask(attention_mask, target_length=seq_len)
+                attn_keep = output_mask.unsqueeze(1).expand(-1, seq_len, -1)
+                attn_keep = attn_keep & attn_keep.transpose(1, 2)
+            if causal:
+                block = torch.arange(seq_len, device=hidden_states.device) // (right_context + 1)
+                causal_keep = (block[:, None] >= block[None, :]).unsqueeze(0)  # query block >= key block
+                attn_keep = causal_keep if attn_keep is None else attn_keep & causal_keep
+            layer_mask = attn_keep.unsqueeze(1) if attn_keep is not None else None
+
+            for encoder_layer in encoder.layers:
+                hidden_states = encoder_layer(
+                    hidden_states, attention_mask=layer_mask, position_embeddings=position_embeddings
+                )
+            # Match `ParakeetEncoder.forward`, which returns the subsampled frame mask as an int tensor.
+            return hidden_states, (output_mask.int() if output_mask is not None else None), None
+
+        # Cache-aware streaming path: subsampling has already been applied by the caller (which feeds chunks of
+        # already-subsampled, *unscaled* embeddings as `input_features`). `attention_mask` is ignored (synchronous,
+        # batch-uniform). Scaling is applied here so the caller mirrors offline subsampling exactly.
+        hidden_states = self._conformer_streaming_step(input_features * encoder.input_scale, cache, right_context)
+        return hidden_states, None, cache
+
+    def init_streaming_conformer_state(
+        self, batch_size: int = 1, device=None, dtype=None
+    ) -> SortformerStreamingConformerState:
+        """Create an empty [`SortformerStreamingConformerState`] for cache-aware streaming of the encoder layers."""
+        device = device if device is not None else next(self.parameters()).device
+        dtype = dtype if dtype is not None else next(self.parameters()).dtype
+        encoder_config = self.config.encoder_config
+        hidden_size = encoder_config.hidden_size
+        num_heads = encoder_config.num_attention_heads
+        head_dim = hidden_size // num_heads
+        conv_cache = encoder_config.conv_kernel_size - 1
+        num_layers = encoder_config.num_hidden_layers
+        return SortformerStreamingConformerState(
+            key_cache=[
+                torch.zeros(batch_size, num_heads, 0, head_dim, device=device, dtype=dtype) for _ in range(num_layers)
+            ],
+            value_cache=[
+                torch.zeros(batch_size, num_heads, 0, head_dim, device=device, dtype=dtype) for _ in range(num_layers)
+            ],
+            last_time=[
+                torch.zeros(batch_size, hidden_size, conv_cache, device=device, dtype=dtype) for _ in range(num_layers)
+            ],
+            offset=0,
+        )
+
+    def _conformer_streaming_step(
+        self, scaled_chunk: torch.Tensor, state: SortformerStreamingConformerState, right_context: int = 7
+    ) -> torch.Tensor:
+        """Run the FastConformer layers on one chunk of already-subsampled-and-scaled embeddings, cache-aware.
+
+        Each query frame attends to the whole history (growing K/V cache) and to look-ahead frames within its own chunk
+        (`chunked_limited` with unlimited left, right context `right_context`); convolutions are causal. Updates `state`
+        in place and returns the chunk's encoder embeddings `(batch, n, d_model)`.
+        """
+        encoder = self.encoder
+        chunk_size = right_context + 1
+        cache_len = state.key_cache[0].shape[2]
+        n = scaled_chunk.shape[1]
+        kv_length = cache_len + n
+
+        position_embeddings = encoder.encode_positions(
+            scaled_chunk.new_zeros(scaled_chunk.shape[0], kv_length, scaled_chunk.shape[2])
+        )
+        # chunked-limited keep-mask with unlimited left: a query attends keys in its own chunk (look-ahead up to the
+        # chunk boundary) and all earlier chunks, never a later chunk.
+        absolute = torch.arange(state.offset - cache_len, state.offset + n, device=scaled_chunk.device)
+        chunk_idx = torch.div(absolute, chunk_size, rounding_mode="trunc")
+        diff = chunk_idx[cache_len:, None] - chunk_idx[None, :]
+        attention_mask = (diff >= 0).unsqueeze(0)
+
+        left_padding = self.config.encoder_config.conv_kernel_size - 1
+        hidden_states = scaled_chunk
+        new_key, new_value, new_time = [], [], []
+        for i, layer in enumerate(encoder.layers):
+            hidden_states = hidden_states + 0.5 * layer.feed_forward1(layer.norm_feed_forward1(hidden_states))
+            normed = layer.norm_self_att(hidden_states)
+            attn_output, key_states, value_states = _conformer_streaming_attention(
+                layer.self_attn, normed, position_embeddings, state.key_cache[i], state.value_cache[i], attention_mask
+            )
+            hidden_states = hidden_states + attn_output
+            conv_output, conv_cache = _conformer_streaming_conv(
+                layer.conv, layer.norm_conv(hidden_states), state.last_time[i], left_padding
+            )
+            hidden_states = hidden_states + conv_output
+            hidden_states = hidden_states + 0.5 * layer.feed_forward2(layer.norm_feed_forward2(hidden_states))
+            hidden_states = layer.norm_out(hidden_states)
+            new_key.append(key_states)
+            new_value.append(value_states)
+            new_time.append(conv_cache)
+
+        state.key_cache, state.value_cache, state.last_time, state.offset = (
+            new_key,
+            new_value,
+            new_time,
+            state.offset + n,
+        )
+        return hidden_states
+
+    def streaming_encode(
+        self, input_features: torch.Tensor, right_context: int = 7, chunk_size: int | None = None
+    ) -> torch.Tensor:
+        """Cache-aware streaming of the FastConformer encoder over `input_features` (whole-utterance convenience).
+
+        The convolutional subsampling is run once up front (it is cheap and its weights are non-causal); the conformer
+        layers are then streamed in `right_context + 1`-frame chunks (or `chunk_size` frames) with growing attention
+        caches. Returns the encoder output `(batch, num_subsampled_frames, d_model)`, the streaming analog of
+        `self.encoder(...)`.
+        """
+        encoder = self.encoder
+        subsampled = encoder.subsampling(input_features)
+        step = chunk_size if chunk_size is not None else right_context + 1
+        state = self.init_streaming_conformer_state(subsampled.shape[0], subsampled.device, subsampled.dtype)
+        outputs, pos, total = [], 0, subsampled.shape[1]
+        while pos < total:
+            end = min(pos + step, total)
+            hidden_states, _, state = self._conformer_forward(
+                subsampled[:, pos:end], cache=state, right_context=right_context
+            )
+            outputs.append(hidden_states)
+            pos = end
+        return torch.cat(outputs, dim=1)
+
 
 @auto_docstring(
     custom_intro="""
@@ -356,6 +611,22 @@ class SortformerForAudioFrameClassification(SortformerPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    @torch.no_grad()
+    def streaming_diarize(
+        self, input_features: torch.Tensor, right_context: int = 7, chunk_size: int | None = None
+    ) -> torch.Tensor:
+        """Diarize with the cache-aware *streaming conformer* encoder (see [`SortformerModel.streaming_encode`]).
+
+        The FastConformer runs as a low-latency cache-aware stream (causal convs + growing attention cache + bounded
+        `right_context` look-ahead); the Transformer encoder and speaker head then run over the resulting embeddings.
+        Returns per-frame speaker-activity `logits` of shape `(batch, num_frames, num_speakers)` (apply `.sigmoid()`).
+        """
+        hidden_states = self.sortformer.streaming_encode(input_features, right_context, chunk_size)
+        if self.sortformer.encoder_proj is not None:
+            hidden_states = self.sortformer.encoder_proj(hidden_states)
+        hidden_states = self.sortformer.transformer_encoder(hidden_states, None)
+        return self.speaker_head(hidden_states)
 
     # ------------------------------------------------------------------------------------------------------------------
     # Streaming (Arrival-Order Speaker Cache) inference.
